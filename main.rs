@@ -6,19 +6,15 @@ use axum::{
     Router,
 };
 use serde::{Deserialize, Serialize};
-use solana_program::{
-    instruction::{AccountMeta, Instruction},
-    pubkey::Pubkey,
-    system_instruction,
-    system_program,
-};
-use solana_sdk::signature::{Keypair, Signature, Signer};
+use solana_program::{pubkey::Pubkey, system_instruction, system_program};
+use solana_sdk::signature::{Keypair, Signer};
 use spl_token::instruction as token_instruction;
-use spl_associated_token_account::{instruction as ata_instruction, get_associated_token_address};
+use spl_associated_token_account::get_associated_token_address;
 use std::str::FromStr;
-use ed25519_dalek::{Signature as Ed25519Signature, Signer as Ed25519Signer, Keypair as Ed25519Keypair, PublicKey, Verifier};
+use ed25519_dalek::{Keypair as EdKeypair, PublicKey, Signature as EdSignature, Signer as DalekSigner, Verifier};
 use rand::rngs::OsRng;
-use base64;
+use rand_core::CryptoRng;
+use base64::{engine::general_purpose::STANDARD, Engine};
 use bs58;
 
 #[derive(Serialize)]
@@ -86,10 +82,8 @@ struct KeypairData {
 #[derive(Serialize)]
 struct AccountMetaData {
     pubkey: String,
-    #[serde(rename = "isSigner")]
-    is_signer: bool,
-    #[serde(rename = "isWritable")]
-    is_writable: bool,
+    isSigner: bool,
+    isWritable: bool,
 }
 
 #[derive(Serialize)]
@@ -123,8 +117,7 @@ struct SolTransferData {
 #[derive(Serialize)]
 struct TokenTransferAccount {
     pubkey: String,
-    #[serde(rename = "isSigner")]
-    is_signer: bool,
+    isSigner: bool,
 }
 
 #[derive(Serialize)]
@@ -134,210 +127,164 @@ struct TokenTransferData {
     instruction_data: String,
 }
 
-fn create_error_response(message: &str) -> (StatusCode, ResponseJson<ErrorResponse>) {
+fn create_error_response(msg: &str) -> (StatusCode, ResponseJson<ErrorResponse>) {
     (
         StatusCode::BAD_REQUEST,
         ResponseJson(ErrorResponse {
             success: false,
-            error: message.to_string(),
+            error: msg.to_string(),
         }),
     )
 }
 
-fn validate_pubkey(pubkey_str: &str) -> Result<Pubkey, String> {
-    Pubkey::from_str(pubkey_str).map_err(|_| "Invalid public key format".to_string())
+fn validate_pubkey(s: &str) -> Result<Pubkey, String> {
+    Pubkey::from_str(s).map_err(|_| "Invalid public key format".to_string())
 }
 
-fn validate_secret_key(secret_str: &str) -> Result<[u8; 64], String> {
-    let decoded = bs58::decode(secret_str)
-        .into_vec()
-        .map_err(|_| "Invalid secret key format")?;
-    if decoded.len() != 64 {
+fn validate_secret_key(s: &str) -> Result<[u8; 64], String> {
+    let bytes = bs58::decode(s).into_vec().map_err(|_| "Invalid secret key format")?;
+    if bytes.len() != 64 {
         return Err("Invalid secret key length".to_string());
     }
-    let mut secret = [0u8; 64];
-    secret.copy_from_slice(&decoded);
-    Ok(secret)
+    let mut arr = [0u8; 64];
+    arr.copy_from_slice(&bytes);
+    Ok(arr)
 }
 
 async fn generate_keypair() -> ResponseJson<SuccessResponse<KeypairData>> {
-    let keypair = Keypair::new();
-    let pubkey = keypair.pubkey().to_string();
-    let secret = bs58::encode(&keypair.to_bytes()).into_string();
+    let mut rng = OsRng;
+    let kp = Keypair::generate(&mut rng);
+    let pubkey = kp.pubkey().to_string();
+    let secret = bs58::encode(kp.to_bytes()).into_string();
     ResponseJson(SuccessResponse {
         success: true,
         data: KeypairData { pubkey, secret },
     })
 }
 
-async fn create_token(Json(payload): Json<CreateTokenRequest>)
-    -> Result<ResponseJson<SuccessResponse<InstructionData>>, (StatusCode, ResponseJson<ErrorResponse>)>
-{
-    let mint_authority = validate_pubkey(&payload.mint_authority)
-        .map_err(|e| create_error_response(&e))?;
-    let mint = validate_pubkey(&payload.mint)
-        .map_err(|e| create_error_response(&e))?;
-
-    let instruction = token_instruction::initialize_mint(
+async fn create_token(Json(p): Json<CreateTokenRequest>) -> Result<ResponseJson<SuccessResponse<InstructionData>>, (StatusCode, ResponseJson<ErrorResponse>)> {
+    let mint_auth = validate_pubkey(&p.mint_authority).map_err(|e| create_error_response(&e))?;
+    let mint = validate_pubkey(&p.mint).map_err(|e| create_error_response(&e))?;
+    let inst = token_instruction::initialize_mint(
         &spl_token::id(),
         &mint,
-        &mint_authority,
-        Some(&mint_authority),
-        payload.decimals,
+        &mint_auth,
+        Some(&mint_auth),
+        p.decimals,
     ).map_err(|_| create_error_response("Failed to create mint instruction"))?;
-
-    let accounts = instruction.accounts.iter().map(|acc| AccountMetaData {
-        pubkey: acc.pubkey.to_string(),
-        is_signer: acc.is_signer,
-        is_writable: acc.is_writable,
+    let accounts = inst.accounts.into_iter().map(|a| AccountMetaData {
+        pubkey: a.pubkey.to_string(),
+        isSigner: a.is_signer,
+        isWritable: a.is_writable,
     }).collect();
-
     Ok(ResponseJson(SuccessResponse {
         success: true,
         data: InstructionData {
-            program_id: instruction.program_id.to_string(),
+            program_id: inst.program_id.to_string(),
             accounts,
-            instruction_data: base64::encode(&instruction.data),
+            instruction_data: STANDARD.encode(&inst.data),
         },
     }))
 }
 
-async fn mint_token(Json(payload): Json<MintTokenRequest>)
-    -> Result<ResponseJson<SuccessResponse<InstructionData>>, (StatusCode, ResponseJson<ErrorResponse>)>
-{
-    let mint = validate_pubkey(&payload.mint).map_err(|e| create_error_response(&e))?;
-    let destination = validate_pubkey(&payload.destination).map_err(|e| create_error_response(&e))?;
-    let authority = validate_pubkey(&payload.authority).map_err(|e| create_error_response(&e))?;
-
-    let instruction = token_instruction::mint_to(
-        &spl_token::id(),
-        &mint,
-        &destination,
-        &authority,
-        &[],
-        payload.amount,
-    ).map_err(|_| create_error_response("Failed to create mint instruction"))?;
-
-    let accounts = instruction.accounts.iter().map(|acc| AccountMetaData {
-        pubkey: acc.pubkey.to_string(),
-        is_signer: acc.is_signer,
-        is_writable: acc.is_writable,
+async fn mint_token(Json(p): Json<MintTokenRequest>) -> Result<ResponseJson<SuccessResponse<InstructionData>>, (StatusCode, ResponseJson<ErrorResponse>)> {
+    let mint = validate_pubkey(&p.mint).map_err(|e| create_error_response(&e))?;
+    let dest = validate_pubkey(&p.destination).map_err(|e| create_error_response(&e))?;
+    let auth = validate_pubkey(&p.authority).map_err(|e| create_error_response(&e))?;
+    let inst = token_instruction::mint_to(&spl_token::id(), &mint, &dest, &auth, &[], p.amount)
+        .map_err(|_| create_error_response("Failed to create mint instruction"))?;
+    let accounts = inst.accounts.into_iter().map(|a| AccountMetaData {
+        pubkey: a.pubkey.to_string(),
+        isSigner: a.is_signer,
+        isWritable: a.is_writable,
     }).collect();
-
     Ok(ResponseJson(SuccessResponse {
         success: true,
         data: InstructionData {
-            program_id: instruction.program_id.to_string(),
+            program_id: inst.program_id.to_string(),
             accounts,
-            instruction_data: base64::encode(&instruction.data),
+            instruction_data: STANDARD.encode(&inst.data),
         },
     }))
 }
 
-async fn sign_message(Json(payload): Json<SignMessageRequest>)
-    -> Result<ResponseJson<SuccessResponse<SignatureData>>, (StatusCode, ResponseJson<ErrorResponse>)>
-{
-    if payload.message.is_empty() || payload.secret.is_empty() {
+async fn sign_message(Json(p): Json<SignMessageRequest>) -> Result<ResponseJson<SuccessResponse<SignatureData>>, (StatusCode, ResponseJson<ErrorResponse>)> {
+    if p.message.is_empty() || p.secret.is_empty() {
         return Err(create_error_response("Missing required fields"));
     }
-
-    let secret_bytes = validate_secret_key(&payload.secret).map_err(|e| create_error_response(&e))?;
-    let keypair = Ed25519Keypair::from_bytes(&secret_bytes).map_err(|_| create_error_response("Invalid secret key"))?;
-    let signature = keypair.sign(payload.message.as_bytes());
-
+    let sk = validate_secret_key(&p.secret).map_err(|e| create_error_response(&e))?;
+    let edkp = EdKeypair::from_bytes(&sk).map_err(|_| create_error_response("Invalid secret key"))?;
+    let sig = edkp.sign(p.message.as_bytes());
     Ok(ResponseJson(SuccessResponse {
         success: true,
         data: SignatureData {
-            signature: base64::encode(signature.to_bytes()),
-            public_key: bs58::encode(keypair.public.to_bytes()).into_string(),
-            message: payload.message,
+            signature: STANDARD.encode(sig.to_bytes()),
+            public_key: bs58::encode(edkp.public.to_bytes()).into_string(),
+            message: p.message,
         },
     }))
 }
 
-async fn verify_message(Json(payload): Json<VerifyMessageRequest>)
-    -> Result<ResponseJson<SuccessResponse<VerifyData>>, (StatusCode, ResponseJson<ErrorResponse>)>
-{
-    if payload.message.is_empty() || payload.signature.is_empty() || payload.pubkey.is_empty() {
+async fn verify_message(Json(p): Json<VerifyMessageRequest>) -> Result<ResponseJson<SuccessResponse<VerifyData>>, (StatusCode, ResponseJson<ErrorResponse>)> {
+    if p.message.is_empty() || p.signature.is_empty() || p.pubkey.is_empty() {
         return Err(create_error_response("Missing required fields"));
     }
-
-    let signature_bytes = base64::decode(&payload.signature).map_err(|_| create_error_response("Invalid signature format"))?;
-    let pubkey_bytes = bs58::decode(&payload.pubkey).into_vec().map_err(|_| create_error_response("Invalid public key format"))?;
-    if pubkey_bytes.len() != 32 {
+    let sig_bytes = STANDARD.decode(&p.signature).map_err(|_| create_error_response("Invalid signature format"))?;
+    let pk_bytes = bs58::decode(&p.pubkey).into_vec().map_err(|_| create_error_response("Invalid public key format"))?;
+    if pk_bytes.len() != 32 {
         return Err(create_error_response("Invalid public key length"));
     }
-
-    let mut pubkey_array = [0u8; 32];
-    pubkey_array.copy_from_slice(&pubkey_bytes);
-    let public_key = PublicKey::from_bytes(&pubkey_array).map_err(|_| create_error_response("Invalid public key"))?;
-    let signature = Ed25519Signature::from_bytes(&signature_bytes).map_err(|_| create_error_response("Invalid signature"))?;
-    let valid = public_key.verify(payload.message.as_bytes(), &signature).is_ok();
-
+    let public_key = PublicKey::from_bytes(&pk_bytes).map_err(|_| create_error_response("Invalid public key"))?;
+    let ed_sig = EdSignature::from_bytes(&sig_bytes).map_err(|_| create_error_response("Invalid signature"))?;
+    let valid = public_key.verify(p.message.as_bytes(), &ed_sig).is_ok();
     Ok(ResponseJson(SuccessResponse {
         success: true,
         data: VerifyData {
             valid,
-            message: payload.message,
-            pubkey: payload.pubkey,
+            message: p.message,
+            pubkey: p.pubkey,
         },
     }))
 }
 
-async fn send_sol(Json(payload): Json<SendSolRequest>)
-    -> Result<ResponseJson<SuccessResponse<SolTransferData>>, (StatusCode, ResponseJson<ErrorResponse>)>
-{
-    let from = validate_pubkey(&payload.from).map_err(|e| create_error_response(&e))?;
-    let to = validate_pubkey(&payload.to).map_err(|e| create_error_response(&e))?;
-    if payload.lamports == 0 {
+async fn send_sol(Json(p): Json<SendSolRequest>) -> Result<ResponseJson<SuccessResponse<SolTransferData>>, (StatusCode, ResponseJson<ErrorResponse>)> {
+    let from = validate_pubkey(&p.from).map_err(|e| create_error_response(&e))?;
+    let to = validate_pubkey(&p.to).map_err(|e| create_error_response(&e))?;
+    if p.lamports == 0 {
         return Err(create_error_response("Invalid amount"));
     }
-
-    let instruction = system_instruction::transfer(&from, &to, payload.lamports);
-
+    let inst = system_instruction::transfer(&from, &to, p.lamports);
     Ok(ResponseJson(SuccessResponse {
         success: true,
         data: SolTransferData {
             program_id: system_program::id().to_string(),
             accounts: vec![from.to_string(), to.to_string()],
-            instruction_data: base64::encode(&instruction.data),
+            instruction_data: STANDARD.encode(&inst.data),
         },
     }))
 }
 
-async fn send_token(Json(payload): Json<SendTokenRequest>)
-    -> Result<ResponseJson<SuccessResponse<TokenTransferData>>, (StatusCode, ResponseJson<ErrorResponse>)>
-{
-    let destination = validate_pubkey(&payload.destination).map_err(|e| create_error_response(&e))?;
-    let mint = validate_pubkey(&payload.mint).map_err(|e| create_error_response(&e))?;
-    let owner = validate_pubkey(&payload.owner).map_err(|e| create_error_response(&e))?;
-    if payload.amount == 0 {
+async fn send_token(Json(p): Json<SendTokenRequest>) -> Result<ResponseJson<SuccessResponse<TokenTransferData>>, (StatusCode, ResponseJson<ErrorResponse>)> {
+    let dst = validate_pubkey(&p.destination).map_err(|e| create_error_response(&e))?;
+    let mint = validate_pubkey(&p.mint).map_err(|e| create_error_response(&e))?;
+    let owner = validate_pubkey(&p.owner).map_err(|e| create_error_response(&e))?;
+    if p.amount == 0 {
         return Err(create_error_response("Invalid amount"));
     }
-
     let source_ata = get_associated_token_address(&owner, &mint);
-    let dest_ata = get_associated_token_address(&destination, &mint);
-
-    let instruction = token_instruction::transfer(
-        &spl_token::id(),
-        &source_ata,
-        &dest_ata,
-        &owner,
-        &[],
-        payload.amount,
-    ).map_err(|_| create_error_response("Failed to create token transfer instruction"))?;
-
-    let accounts = instruction.accounts.iter().map(|acc| TokenTransferAccount {
-        pubkey: acc.pubkey.to_string(),
-        is_signer: acc.is_signer,
+    let dest_ata = get_associated_token_address(&dst, &mint);
+    let inst = token_instruction::transfer(&spl_token::id(), &source_ata, &dest_ata, &owner, &[], p.amount)
+        .map_err(|_| create_error_response("Failed to create token transfer instruction"))?;
+    let accounts = inst.accounts.into_iter().map(|a| TokenTransferAccount {
+        pubkey: a.pubkey.to_string(),
+        isSigner: a.is_signer,
     }).collect();
-
     Ok(ResponseJson(SuccessResponse {
         success: true,
         data: TokenTransferData {
-            program_id: instruction.program_id.to_string(),
+            program_id: inst.program_id.to_string(),
             accounts,
-            instruction_data: base64::encode(&instruction.data),
+            instruction_data: STANDARD.encode(&inst.data),
         },
     }))
 }
@@ -352,14 +299,9 @@ async fn main() {
         .route("/message/verify", post(verify_message))
         .route("/send/sol", post(send_sol))
         .route("/send/token", post(send_token))
-        .layer(
-            tower_http::cors::CorsLayer::new()
-                .allow_origin(tower_http::cors::Any)
-                .allow_methods(tower_http::cors::Any)
-                .allow_headers(tower_http::cors::Any),
-        );
+        .layer(tower_http::cors::CorsLayer::new().allow_origin(tower_http::cors::Any).allow_methods(tower_http::cors::Any).allow_headers(tower_http::cors::Any));
 
     let listener = tokio::net::TcpListener::bind("0.0.0.0:3000").await.unwrap();
-    println!("Server running on http://0.0.0.0:3000");
+    println!("Server http://0.0.0.0:3000");
     axum::serve(listener, app).await.unwrap();
 }
